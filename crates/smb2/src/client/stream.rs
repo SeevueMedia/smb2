@@ -927,6 +927,61 @@ impl FileReader {
         self.version
     }
 
+    /// Check fresh metadata on this same open handle against its version at open.
+    ///
+    /// Queries size, last-write time, change time and identity without resolving
+    /// or reopening the path. The requests use this reader's pinned session.
+    /// Call before and after a ranged read when publishing version-keyed bytes;
+    /// discard those bytes on any error. This is not a snapshot or a lease.
+    pub async fn validate_version(&self) -> Result<()> {
+        use crate::client::connection::CompoundOp;
+        use crate::client::tree::{
+            all_or_first_err, file_info_from, FILE_BASIC_INFORMATION, FILE_STANDARD_INFORMATION,
+        };
+        use crate::msg::query_info::{InfoType, QueryInfoRequest};
+
+        let query = |class, size| QueryInfoRequest {
+            info_type: InfoType::File,
+            file_info_class: class,
+            output_buffer_length: size,
+            additional_information: 0,
+            flags: 0,
+            file_id: self.file_id,
+            input_buffer: vec![],
+        };
+        let basic = query(FILE_BASIC_INFORMATION, 40);
+        let standard = query(FILE_STANDARD_INFORMATION, 24);
+        let mut index = FileIdentity::index_query();
+        let mut volume = FileIdentity::volume_query();
+        index.file_id = self.file_id;
+        volume.file_id = self.file_id;
+        let ops = [&basic, &standard, &index, &volume].map(|body| CompoundOp {
+            command: Command::QueryInfo,
+            body,
+            tree_id: Some(self.tree.tree_id),
+            credit_charge: CreditCharge(1),
+        });
+        let frames = all_or_first_err(self.conn.execute_compound(&ops).await?, ops.len())?;
+        for frame in &frames[..2] {
+            if frame.header.status != NtStatus::SUCCESS {
+                return Err(Error::Protocol {
+                    status: frame.header.status,
+                    command: Command::QueryInfo,
+                });
+            }
+        }
+        let info = file_info_from(&frames[0].body, &frames[1].body)?;
+        let identity = FileIdentity::from_frames(Some(&frames[2]), Some(&frames[3]));
+        let current = FileVersion::at_open(&info, identity);
+        if let Some(change) = self.version.change_to(&current) {
+            return Err(Error::FileChanged {
+                path: self.path.clone(),
+                change,
+            });
+        }
+        Ok(())
+    }
+
     /// The durable handle behind this reader, when it was opened with
     /// [`ReaderOptions::durable`] and the server granted one. `None` is the
     /// normal outcome on a server that doesn't do durable handles.
@@ -2007,6 +2062,9 @@ impl Drop for FileWriter {
 
 #[cfg(test)]
 mod tests {
+    mod live_version {
+        include!("stream_live_tests.rs");
+    }
     use super::*;
     use crate::client::test_helpers::{
         build_close_error_response, build_close_response, build_create_response,

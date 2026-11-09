@@ -51,8 +51,9 @@
 //! checks length and times alone. A server that proved the identity at open
 //! and won't at reopen fails the check, which is the safe direction.
 //!
-//! ❗ The whole check is best-effort and happens at the reopen only. Nothing
-//! tells a live reader that another client wrote to the file under it.
+//! The check is best-effort. Consumers caching positioned reads can bracket
+//! them with [`FileReader::validate_version`], which queries the same live
+//! handle and refuses changed metadata before publishing the bytes.
 //!
 //! ## Durable first, path second
 //!
